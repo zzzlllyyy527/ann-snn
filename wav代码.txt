@@ -1,0 +1,694 @@
+import os
+import re
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+from torch.utils.data import DataLoader, TensorDataset
+from collections import defaultdict
+import random
+
+from scipy.signal import find_peaks, resample, stft, istft
+from scipy.io import wavfile
+import snntorch as snn  # ✅ SNN
+
+# =================== 固定随机种子 ===================
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device, "| torch:", torch.__version__, "| cuda:", torch.cuda.is_available())
+
+# =================== 从文件名解析标签 ===================
+def parse_label_from_filename(fname: str):
+    base = os.path.basename(fname)
+    m = re.match(r"^\s*(\d)", base)
+    return int(m.group(1)) if m else None
+
+# =================== WAV 读取与写回 ===================
+def read_wav_mono(path):
+    sr, x = wavfile.read(path)
+
+    if x.dtype == np.int16:
+        x = x.astype(np.float32) / 32768.0
+    elif x.dtype == np.int32:
+        x = x.astype(np.float32) / 2147483648.0
+    elif x.dtype == np.uint8:
+        x = (x.astype(np.float32) - 128.0) / 128.0
+    else:
+        x = x.astype(np.float32)
+
+    if x.ndim == 2:
+        x = x.mean(axis=1)
+
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return sr, x
+
+def write_wav_int16(path, sr, x_float):
+    x = np.asarray(x_float, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.clip(x, -1.0, 1.0)
+    x_int16 = (x * 32767.0).astype(np.int16)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    wavfile.write(path, sr, x_int16)
+
+def normalize_proportional(signal):
+    signal = np.asarray(signal, dtype=float)
+    min_val = np.min(signal)
+    max_val = np.max(signal)
+    if max_val == min_val:
+        return np.ones_like(signal) * 0.5
+    return 0.01 + 0.99 * (signal - min_val) / (max_val - min_val)
+
+# =================== 数据集加载（WAV，单层目录） ===================
+def load_wav_dataset_from_root(root_dir, mode="clean"):
+    data_by_label = defaultdict(list)
+
+    for file in sorted(os.listdir(root_dir)):
+        if not file.lower().endswith(".wav"):
+            continue
+
+        label = parse_label_from_filename(file)
+        if label is None:
+            continue
+
+        full_path = os.path.join(root_dir, file)
+        _, sig = read_wav_mono(full_path)
+        if sig is None or len(sig) == 0:
+            continue
+
+        # 归一化到 0.01~0.99（保持你原来逻辑）
+        sig = normalize_proportional(sig)
+        data_by_label[int(label)].append(sig)
+
+    return data_by_label
+
+# =========================================================
+# ✅ 谱减法（Spectral Subtraction）降噪
+# =========================================================
+def spectral_subtraction_denoise(
+    x, sr,
+    nperseg=512, noverlap=None,
+    noise_sec=0.2,
+    alpha=1.0,
+    beta=0.02,
+    smooth_noise=0.0,
+):
+    """
+    经典谱减：|S| = max(|Y| - alpha*|D|, beta*|Y|)
+    """
+    x = np.asarray(x, dtype=np.float32)
+    if x.size < 8:
+        return x
+
+    if noverlap is None:
+        noverlap = nperseg // 2
+
+    hop = nperseg - noverlap
+    if hop <= 0:
+        noverlap = nperseg // 2
+        hop = nperseg - noverlap
+
+    f, t, Z = stft(
+        x, fs=sr, window="hann",
+        nperseg=nperseg, noverlap=noverlap,
+        boundary="zeros", padded=True
+    )
+
+    mag = np.abs(Z)
+    phase = np.angle(Z)
+
+    noise_frames = max(1, int(noise_sec * sr / hop))
+    noise_frames = min(noise_frames, mag.shape[1])
+    noise_mag = np.mean(mag[:, :noise_frames], axis=1, keepdims=True)
+
+    if smooth_noise and 0 < smooth_noise < 1.0:
+        a = float(smooth_noise)
+        D = noise_mag.copy()
+        for k in range(1, D.shape[0]):
+            D[k] = a * D[k-1] + (1-a) * D[k]
+        noise_mag = D
+
+    mag_clean = mag - alpha * noise_mag
+    mag_floor = beta * mag
+    mag_clean = np.maximum(mag_clean, mag_floor)
+
+    Z_clean = mag_clean * np.exp(1j * phase)
+
+    _, x_rec = istft(
+        Z_clean, fs=sr, window="hann",
+        nperseg=nperseg, noverlap=noverlap,
+        input_onesided=True, boundary=True
+    )
+
+    if x_rec.size > x.size:
+        x_rec = x_rec[:x.size]
+    elif x_rec.size < x.size:
+        x_rec = np.pad(x_rec, (0, x.size - x_rec.size), mode="edge")
+
+    x_rec = np.nan_to_num(x_rec, nan=0.0, posinf=0.0, neginf=0.0)
+    mx = np.max(np.abs(x_rec)) + 1e-9
+    if mx > 1.0:
+        x_rec = x_rec / mx
+
+    return x_rec.astype(np.float32)
+
+def denoise_wav_folder_spectral_subtraction(
+    noisy_root, denoised_root,
+    overwrite=True,               # ✅ 默认：覆盖旧文件，保证调参有效
+    nperseg=512,
+    noise_sec=0.2,
+    alpha=1.0,
+    beta=0.02,
+    smooth_noise=0.0,
+    print_every=50
+):
+    os.makedirs(denoised_root, exist_ok=True)
+    wavs = [f for f in sorted(os.listdir(noisy_root)) if f.lower().endswith(".wav")]
+
+    processed, skipped = 0, 0
+    for idx, fn in enumerate(wavs, 1):
+        in_path = os.path.join(noisy_root, fn)
+        out_path = os.path.join(denoised_root, fn)
+
+        if (not overwrite) and os.path.exists(out_path):
+            skipped += 1
+            continue
+
+        sr, x = read_wav_mono(in_path)
+        x_dn = spectral_subtraction_denoise(
+            x, sr,
+            nperseg=nperseg,
+            noverlap=nperseg // 2,
+            noise_sec=noise_sec,
+            alpha=alpha,
+            beta=beta,
+            smooth_noise=smooth_noise
+        )
+        write_wav_int16(out_path, sr, x_dn)
+        processed += 1
+
+        if print_every and (idx % print_every == 0):
+            print(f"[SpectralSub] {idx}/{len(wavs)} processed={processed}, skipped={skipped}")
+
+    print(f"[SpectralSub] 完成：total={len(wavs)} processed={processed} skipped={skipped}")
+    print("输出目录：", os.path.abspath(denoised_root))
+
+# =================== 核心：不依赖时间的“计数编码” ===================
+def robust_norm_01(x, eps=1e-6, z_clip=10.0):
+    x = np.asarray(x, dtype=float)
+    med = np.median(x, axis=0)
+    mad = np.median(np.abs(x - med), axis=0) + eps
+    z = (x - med) / mad
+    z = np.clip(z, -z_clip, z_clip)  # ✅ 防 overflow
+    return 1.0 / (1.0 + np.exp(-z))
+
+def segment_stats_with_peakcount(signal, num_segments=40, peak_prom=0.15, min_len=64):
+    signal = np.asarray(signal, dtype=float)
+    n = len(signal)
+
+    target_min = int(num_segments * min_len)
+    if n < target_min and n > 1:
+        signal = resample(signal, target_min).astype(float)
+        n = len(signal)
+
+    if n < 2:
+        signal = np.pad(signal, (0, max(1, target_min - n)), mode="edge")
+        n = len(signal)
+
+    seg_len = n // num_segments
+    if seg_len < 2:
+        signal = resample(signal, num_segments * 2).astype(float)
+        n = len(signal)
+        seg_len = max(2, n // num_segments)
+
+    feats = []
+    for i in range(num_segments):
+        start = i * seg_len
+        end = (i + 1) * seg_len if i < num_segments - 1 else n
+        seg = signal[start:end]
+        if seg.size < 2:
+            seg = np.pad(seg, (0, 2 - seg.size), mode="edge")
+
+        mean = float(np.mean(seg))
+        peak = float(np.max(seg))
+        amp  = float(np.max(seg) - np.min(seg))
+
+        peaks, _ = find_peaks(seg, prominence=peak_prom)
+        peak_count = float(len(peaks))
+
+        feats.append([mean, peak, amp, peak_count])
+
+    return np.array(feats, dtype=float)
+
+def threshold_count_encode(feats_01, thr=(0.2, 0.4, 0.6, 0.8)):
+    thr = np.array(thr, dtype=float)
+    counts = (feats_01[..., None] > thr[None, None, :]).sum(axis=-1).astype(np.float32)
+    counts = counts / max(len(thr), 1)
+    return counts
+
+def encode_signal_to_vector(signal,
+                            num_segments=40,
+                            peak_prom=0.15,
+                            thr=(0.2, 0.4, 0.6, 0.8),
+                            peakcount_clip=10,
+                            min_len=64):
+    feats = segment_stats_with_peakcount(
+        signal,
+        num_segments=num_segments,
+        peak_prom=peak_prom,
+        min_len=min_len
+    )
+    feats_01 = robust_norm_01(feats[:, :3])  # (S,3)
+    pc = np.clip(feats[:, 3], 0, peakcount_clip) / float(peakcount_clip)  # (S,)
+    counts = threshold_count_encode(feats_01, thr=thr)  # (S,3)
+
+    vec = np.concatenate([counts.reshape(-1), pc.reshape(-1)], axis=0).astype(np.float32)
+    return vec
+
+def build_vector_dataset_train_val(data_by_label, train_ratio=0.9, num_segments=40,
+                                   peak_prom=0.15, thr=(0.2,0.4,0.6,0.8),
+                                   peakcount_clip=10, min_len=64):
+    X_train, y_train, X_val, y_val = [], [], [], []
+    for label in sorted(data_by_label.keys()):
+        signals = data_by_label[label]
+        if len(signals) < 2:
+            continue
+        tr, va = train_test_split(signals, train_size=train_ratio, random_state=seed)
+        for s in tr:
+            X_train.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip, min_len))
+            y_train.append(label)
+        for s in va:
+            X_val.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip, min_len))
+            y_val.append(label)
+    return np.array(X_train, dtype=np.float32), np.array(y_train), np.array(X_val, dtype=np.float32), np.array(y_val)
+
+def build_vector_dataset_all(data_by_label, num_segments=40,
+                            peak_prom=0.15, thr=(0.2,0.4,0.6,0.8),
+                            peakcount_clip=10, min_len=64):
+    X, y = [], []
+    for label in sorted(data_by_label.keys()):
+        for s in data_by_label[label]:
+            X.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip, min_len))
+            y.append(label)
+    return np.array(X, dtype=np.float32), np.array(y)
+
+# =========================================================
+# ✅ Current Injection
+# =========================================================
+def repeat_current(x: torch.Tensor, T=50, noise_std=0.0):
+    cur = x.unsqueeze(0).repeat(T, 1, 1)
+    if noise_std > 0:
+        cur = cur + noise_std * torch.randn_like(cur)
+    return cur
+
+# =========================================================
+# ✅ ANN + SNN（LIF）分类器
+# =========================================================
+class ANNSNN(nn.Module):
+    def __init__(self, input_dim, hidden1=256, hidden2=128, num_classes=10,
+                 beta=0.9, threshold=1.0, dropout=0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden1)
+        self.ln1 = nn.LayerNorm(hidden1)
+        self.lif1 = snn.Leaky(beta=beta, threshold=threshold)
+        self.dp1 = nn.Dropout(dropout)
+
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.ln2 = nn.LayerNorm(hidden2)
+        self.lif2 = snn.Leaky(beta=beta, threshold=threshold)
+        self.dp2 = nn.Dropout(dropout)
+
+        self.fc3 = nn.Linear(hidden2, num_classes)
+        self.lif_out = snn.Leaky(beta=beta, threshold=threshold)
+
+    def forward(self, x_vec, T=50, noise_std=0.0):
+        cur_in = repeat_current(x_vec, T=T, noise_std=noise_std)
+
+        mem1 = self.lif1.init_leaky()
+        mem2 = self.lif2.init_leaky()
+        memo = self.lif_out.init_leaky()
+
+        mem_out_rec, spk_out_rec = [], []
+        for t in range(T):
+            x = cur_in[t]
+
+            cur1 = self.fc1(x)
+            cur1 = self.ln1(cur1)
+            cur1 = torch.relu(cur1)
+            spk1, mem1 = self.lif1(cur1, mem1)
+            spk1 = self.dp1(spk1)
+
+            cur2 = self.fc2(spk1)
+            cur2 = self.ln2(cur2)
+            cur2 = torch.relu(cur2)
+            spk2, mem2 = self.lif2(cur2, mem2)
+            spk2 = self.dp2(spk2)
+
+            cur3 = self.fc3(spk2)
+            spk3, memo = self.lif_out(cur3, memo)
+
+            mem_out_rec.append(memo)
+            spk_out_rec.append(spk3)
+
+        mem_out = torch.stack(mem_out_rec, dim=0)
+        spk_out = torch.stack(spk_out_rec, dim=0)
+        return mem_out, spk_out
+
+# =================== 训练与评估 ===================
+def train_on_clean_ann_snn(X_train, y_train, X_val, y_val,
+                           epochs=60, batch_size=64, lr=1e-3, weight_decay=2e-3,
+                           T=70, beta=0.9, threshold=0.8, dropout=0.2,
+                           noise_std=0.01, grad_clip=1.0,
+                           avg_last_k=20, vote_k=1):
+    pin = (device.type == "cuda")
+
+    train_ds = TensorDataset(torch.tensor(X_train), torch.tensor(y_train).long())
+    val_ds   = TensorDataset(torch.tensor(X_val),   torch.tensor(y_val).long())
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, pin_memory=pin)
+
+    net = ANNSNN(
+        input_dim=X_train.shape[1],
+        hidden1=256,
+        hidden2=128,
+        num_classes=10,
+        beta=beta,
+        threshold=threshold,
+        dropout=dropout
+    ).to(device)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_acc = -1.0
+    best_state = None
+    loss_list, acc_list = [], []
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        total_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=pin)
+            yb = yb.to(device, non_blocking=pin)
+
+            mem_out, _ = net(xb, T=T, noise_std=noise_std)
+            logits = mem_out[-avg_last_k:].mean(dim=0)
+            loss = loss_fn(logits, yb)
+
+            opt.zero_grad()
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+            opt.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        net.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=pin)
+                yb = yb.to(device, non_blocking=pin)
+
+                logits_sum = 0.0
+                for _ in range(max(1, vote_k)):
+                    mem_out, _ = net(xb, T=T, noise_std=0.0)
+                    logits_sum = logits_sum + mem_out[-avg_last_k:].mean(dim=0)
+
+                pred = (logits_sum / max(1, vote_k)).argmax(dim=1)
+                correct += (pred == yb).sum().item()
+                total += yb.size(0)
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        acc = correct / max(1, total)
+        loss_list.append(avg_loss)
+        acc_list.append(acc)
+
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+
+        cur_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {ep:02d}: Loss={avg_loss:.4f}, ValAcc={acc:.4f}, Best={best_acc:.4f}, LR={cur_lr:.6f}")
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
+
+    return net, loss_list, acc_list
+
+def evaluate_on_dataset_ann_snn(net, X, y, title="Test", T=70, avg_last_k=20, vote_k=5):
+    pin = (device.type == "cuda")
+    ds = TensorDataset(torch.tensor(X), torch.tensor(y).long())
+    loader = DataLoader(ds, batch_size=128, shuffle=False, pin_memory=pin)
+
+    net.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=pin)
+
+            logits_sum = 0.0
+            for _ in range(max(1, vote_k)):
+                mem_out, _ = net(xb, T=T, noise_std=0.0)
+                logits_sum = logits_sum + mem_out[-avg_last_k:].mean(dim=0)
+
+            pred = (logits_sum / max(1, vote_k)).argmax(dim=1).cpu().numpy()
+            y_true.extend(yb.numpy())
+            y_pred.extend(pred)
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    acc = float((y_true == y_pred).mean())
+
+    print(f"\n[{title}] Accuracy: {acc:.4f}\n")
+    print(classification_report(y_true, y_pred, digits=4, zero_division=0))
+
+    cm = confusion_matrix(y_true, y_pred)
+    ConfusionMatrixDisplay(confusion_matrix=cm).plot(cmap="Purples")
+    plt.title(f"Confusion Matrix - {title}")
+    plt.show()
+
+    return y_true, y_pred, acc, cm
+
+def plot_train_curves(loss_list, acc_list):
+    plt.figure()
+    plt.plot(loss_list, label="Loss")
+    plt.plot(acc_list, label="ValAcc")
+    plt.xlabel("Epoch")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Training Curves (ANN + SNN, WAV input)")
+    plt.show()
+
+def save_training_and_cm_to_xlsx(out_path, loss_list, acc_list, cm,
+                                 sheet_name_metrics="metrics",
+                                 sheet_name_cm="clean_confusion"):
+    metrics_df = pd.DataFrame({
+        "epoch": np.arange(1, len(loss_list) + 1),
+        "loss": loss_list,
+        "val_acc": acc_list
+    })
+    cm_df = pd.DataFrame(cm,
+                         index=[f"true_{i}" for i in range(cm.shape[0])],
+                         columns=[f"pred_{i}" for i in range(cm.shape[1])])
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        metrics_df.to_excel(writer, index=False, sheet_name=sheet_name_metrics)
+        cm_df.to_excel(writer, index=True, sheet_name=sheet_name_cm)
+
+    print("已保存训练曲线与混淆矩阵到：", os.path.abspath(out_path))
+
+# =================== 主流程 ===================
+if __name__ == "__main__":
+    clean_root = r"D:降噪声学传感器4.7/fsdd_jackson"
+    noisy_root = r"D:降噪声学传感器4.7/fsdd_jackson_noisy1"
+
+    # ✅ 固定一个“新文件夹”存放降噪数据集（每次覆盖）
+    denoised_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/fsdd_jackson_noisy1_specsub_denoised"
+
+    # ✅ 编码参数（保持你原来的风格）
+    num_segments = 50
+    peak_prom = 0.08
+    peakcount_clip = 5
+    thr = (0.45, 0.55, 0.7, 0.8)
+    min_len = 64
+
+    # ✅ 训练超参
+    lr = 1e-3
+    batch_size = 32
+    weight_decay = 1e-3
+
+    # ✅ SNN 参数
+    T = 70
+    beta = 0.9
+    threshold = 0.8
+    dropout = 0.2
+
+    # ✅ 稳定性增强
+    noise_std = 0.01
+    grad_clip = 1.0
+    epochs = 30
+
+    avg_last_k = 20
+    val_vote_k = 1
+    test_vote_k = 5
+
+    out_xlsx = r"C:/Users/11033/Desktop/clean_metrics_and_cm_ANN_SNN_WAV_specsub.xlsx"
+
+    # ====== 谱减参数（不改你参数）======
+    do_denoise = True
+    overwrite_denoised = True   # ✅ 关键：每次都覆盖，保证调参有效
+
+    noise_sec = 0.05
+    alpha = 3
+    beta_floor = 0.1
+    nperseg = 512
+    smooth_noise = 0.0
+
+    # 1) Clean 数据（训练/验证）
+    clean_by_label = load_wav_dataset_from_root(clean_root, mode="clean")
+    clean_count = sum(len(v) for v in clean_by_label.values())
+    print(f"[Clean-WAV] 加载样本数: {clean_count}")
+
+    X_train, y_train, X_val, y_val = build_vector_dataset_train_val(
+        clean_by_label,
+        train_ratio=0.9,
+        num_segments=num_segments,
+        peak_prom=peak_prom,
+        thr=thr,
+        peakcount_clip=peakcount_clip,
+        min_len=min_len
+    )
+    print(f"[Clean-WAV] Train: {len(X_train)} | Val: {len(X_val)} | Input shape: {X_train.shape} (应为 {num_segments*4})")
+
+    # 2) 训练
+    net, loss_list, acc_list = train_on_clean_ann_snn(
+        X_train, y_train, X_val, y_val,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        T=T,
+        beta=beta,
+        threshold=threshold,
+        dropout=dropout,
+        noise_std=noise_std,
+        grad_clip=grad_clip,
+        avg_last_k=avg_last_k,
+        vote_k=val_vote_k
+    )
+    plot_train_curves(loss_list, acc_list)
+
+    # 3) Clean Val 评估 + 保存
+    _, _, _, cm_clean = evaluate_on_dataset_ann_snn(
+        net, X_val, y_val,
+        title="Clean Val (ANN+SNN, WAV)",
+        T=T,
+        avg_last_k=avg_last_k,
+        vote_k=test_vote_k
+    )
+    save_training_and_cm_to_xlsx(out_xlsx, loss_list, acc_list, cm_clean)
+
+    # 4) Noisy Test（原始噪声数据集）——保留原逻辑
+    noisy_by_label = load_wav_dataset_from_root(noisy_root, mode="noisy")
+    noisy_count = sum(len(v) for v in noisy_by_label.values())
+    print(f"[Noisy-WAV] 加载样本数: {noisy_count}")
+
+    X_noisy, y_noisy = build_vector_dataset_all(
+        noisy_by_label,
+        num_segments=num_segments,
+        peak_prom=peak_prom,
+        thr=thr,
+        peakcount_clip=peakcount_clip,
+        min_len=min_len
+    )
+    print(f"[Noisy-WAV] Test samples: {len(X_noisy)} | Input shape: {X_noisy.shape}")
+
+    evaluate_on_dataset_ann_snn(
+        net, X_noisy, y_noisy,
+        title="Noisy Test (Original) (ANN+SNN, WAV)",
+        T=T,
+        avg_last_k=avg_last_k,
+        vote_k=test_vote_k
+    )
+
+    # 5) ✅ 计时：SpectralSub + Feature + Infer（并输出降噪后准确率）
+    if do_denoise:
+        print("\n===== TIME: WAV (SpectralSub + Feature + Inference) =====")
+
+        # --- 5.1 计时谱减（生成降噪后的新数据集，覆盖写入） ---
+        t0 = time.perf_counter()
+        denoise_wav_folder_spectral_subtraction(
+            noisy_root=noisy_root,
+            denoised_root=denoised_root,
+            overwrite=overwrite_denoised,
+            nperseg=nperseg,
+            noise_sec=noise_sec,
+            alpha=alpha,
+            beta=beta_floor,
+            smooth_noise=smooth_noise
+        )
+        t1 = time.perf_counter()
+        t_specsub = t1 - t0
+
+        # ✅ 快速检查：确认确实覆盖生效
+        test_fn = sorted([f for f in os.listdir(noisy_root) if f.lower().endswith(".wav")])[0]
+        sr0, x0 = read_wav_mono(os.path.join(noisy_root, test_fn))
+        sr1, x1 = read_wav_mono(os.path.join(denoised_root, test_fn))
+        print(f"[Check] example file: {test_fn} | mean|diff|={float(np.mean(np.abs(x0 - x1))):.6f}")
+
+        # --- 5.2 计时特征（denoised_root -> X_den, y_den） ---
+        t2 = time.perf_counter()
+        den_by_label = load_wav_dataset_from_root(denoised_root, mode="denoised")
+        X_den, y_den = build_vector_dataset_all(
+            den_by_label,
+            num_segments=num_segments,
+            peak_prom=peak_prom,
+            thr=thr,
+            peakcount_clip=peakcount_clip,
+            min_len=min_len
+        )
+        t3 = time.perf_counter()
+        t_feature = t3 - t2
+
+        # --- 5.3 计时推理（只对降噪后的 X_den 推理） ---
+        # 为了计时更准确：GPU 需要同步
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t4 = time.perf_counter()
+
+        # 推理：复用你原来的 evaluate（它会打印 accuracy + confusion matrix）
+        _, _, den_acc, _ = evaluate_on_dataset_ann_snn(
+            net, X_den, y_den,
+            title="Noisy Test (Spectral Subtraction, Overwrite) (ANN+SNN, WAV)",
+            T=T,
+            avg_last_k=avg_last_k,
+            vote_k=test_vote_k
+        )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t5 = time.perf_counter()
+        t_infer = t5 - t4
+
+        t_total = t_specsub + t_feature + t_infer
+
+        print("\n===== TIME BREAKDOWN =====")
+        print(f"[TIME] SpectralSub: {t_specsub:.4f} s")
+        print(f"[TIME] Feature    : {t_feature:.4f} s")
+        print(f"[TIME] Inference  : {t_infer:.4f} s")
+        print(f"[TIME] Total (SpectralSub+Feature+Infer): {t_total:.4f} s")
+
+        print("\n===== DENOISED RESULT =====")
+        print(f"[DENOISED ACCURACY] {den_acc:.4f}")

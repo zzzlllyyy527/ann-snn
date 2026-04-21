@@ -1,0 +1,413 @@
+import os
+import re
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+from torch.utils.data import DataLoader, TensorDataset
+from collections import defaultdict
+import random
+
+from scipy.signal import find_peaks
+import snntorch as snn  # ✅ SNN
+
+# =================== 固定随机种子 ===================
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device, "| torch:", torch.__version__, "| cuda:", torch.cuda.is_available())
+
+# =================== 从文件名解析标签 ===================
+def parse_label_from_filename(fname: str):
+    m = re.match(r"^\s*(\d)", fname)
+    return int(m.group(1)) if m else None
+
+# =================== 长度统一：边界值补齐（推荐） ===================
+def fix_length(signal, target_len=1200, pad_mode="edge"):
+    signal = np.asarray(signal, dtype=float)
+    n = len(signal)
+    if n == target_len:
+        return signal
+    if n > target_len:
+        start = (n - target_len) // 2
+        return signal[start:start + target_len]
+
+    pad = target_len - n
+    left = pad // 2
+    right = pad - left
+
+    if pad_mode == "edge":
+        return np.pad(signal, (left, right), mode="edge")
+    elif pad_mode == "reflect":
+        return np.pad(signal, (left, right), mode="reflect")
+    else:
+        return np.pad(signal, (left, right), mode="constant", constant_values=0.0)
+
+# =================== 归一化（用于原始波形） ===================
+def normalize_proportional(signal):
+    signal = np.asarray(signal, dtype=float)
+    min_val = np.min(signal)
+    max_val = np.max(signal)
+    if max_val == min_val:
+        return np.ones_like(signal) * 0.5
+    return 0.01 + 0.99 * (signal - min_val) / (max_val - min_val)
+
+# =================== 读取 xlsx：自动跳过非数值 ===================
+def read_xlsx_signal(path, skiprows=0):
+    df = pd.read_excel(path, header=None, skiprows=skiprows)
+    s = df.iloc[:, 0]
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    return s.to_numpy(dtype=float)
+
+def read_xlsx_signal_clean(path):
+    return read_xlsx_signal(path, skiprows=0)
+
+def read_xlsx_signal_noisy(path):
+    return read_xlsx_signal(path, skiprows=1)
+
+# =================== 数据集加载（不计时） ===================
+def load_dataset_from_root(root_dir, target_len=1200, pad_mode="edge", mode="clean"):
+    data_by_label = defaultdict(list)
+
+    for folder in sorted(os.listdir(root_dir)):
+        folder_path = os.path.join(root_dir, folder)
+        if not os.path.isdir(folder_path):
+            continue
+
+        folder_label = int(folder) if folder.isdigit() else None
+
+        for file in os.listdir(folder_path):
+            if not file.lower().endswith(".xlsx"):
+                continue
+
+            label = parse_label_from_filename(file)
+            if label is None:
+                if folder_label is None:
+                    continue
+                label = folder_label
+
+            full_path = os.path.join(folder_path, file)
+
+            if mode == "noisy":
+                signal = read_xlsx_signal_noisy(full_path)
+            else:
+                signal = read_xlsx_signal_clean(full_path)
+
+            if signal.size == 0:
+                continue
+
+            signal = fix_length(signal, target_len=target_len, pad_mode=pad_mode)
+            signal = normalize_proportional(signal)
+
+            data_by_label[int(label)].append(signal)
+
+    return data_by_label
+
+# =================== 核心：不依赖时间的“计数编码” ===================
+def robust_norm_01(x, eps=1e-6, z_clip=10.0):
+    x = np.asarray(x, dtype=float)
+    med = np.median(x, axis=0)
+    mad = np.median(np.abs(x - med), axis=0) + eps
+    z = (x - med) / mad
+    z = np.clip(z, -z_clip, z_clip)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def segment_stats_with_peakcount(signal, num_segments=40, peak_prom=0.15):
+    signal = np.asarray(signal, dtype=float)
+    n = len(signal)
+    seg_len = n // num_segments
+
+    feats = []
+    for i in range(num_segments):
+        seg = signal[i * seg_len:(i + 1) * seg_len]
+        if seg.size == 0:
+            seg = np.array([0.0])
+
+        mean = float(np.mean(seg))
+        peak = float(np.max(seg))
+        amp  = float(np.max(seg) - np.min(seg))
+
+        peaks, _ = find_peaks(seg, prominence=peak_prom)
+        peak_count = float(len(peaks))
+
+        feats.append([mean, peak, amp, peak_count])
+
+    return np.array(feats, dtype=float)  # (S,4)
+
+def threshold_count_encode(feats_01, thr=(0.2, 0.4, 0.6, 0.8)):
+    thr = np.array(thr, dtype=float)
+    counts = (feats_01[..., None] > thr[None, None, :]).sum(axis=-1).astype(np.float32)
+    counts = counts / max(len(thr), 1)
+    return counts
+
+def encode_signal_to_vector(signal,
+                            num_segments=40,
+                            peak_prom=0.15,
+                            thr=(0.2, 0.4, 0.6, 0.8),
+                            peakcount_clip=10):
+    feats = segment_stats_with_peakcount(signal, num_segments=num_segments, peak_prom=peak_prom)
+    feats_01 = robust_norm_01(feats[:, :3])  # (S,3)
+    pc = np.clip(feats[:, 3], 0, peakcount_clip) / float(peakcount_clip)  # (S,)
+    counts = threshold_count_encode(feats_01, thr=thr)  # (S,3)
+
+    vec = np.concatenate([counts.reshape(-1), pc.reshape(-1)], axis=0).astype(np.float32)
+    return vec  # S*4
+
+def build_vector_dataset_train_val(data_by_label, train_ratio=0.9, num_segments=40,
+                                   peak_prom=0.15, thr=(0.2,0.4,0.6,0.8), peakcount_clip=10):
+    X_train, y_train, X_val, y_val = [], [], [], []
+    for label in sorted(data_by_label.keys()):
+        signals = data_by_label[label]
+        if len(signals) < 2:
+            continue
+        tr, va = train_test_split(signals, train_size=train_ratio, random_state=seed)
+        for s in tr:
+            X_train.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip))
+            y_train.append(label)
+        for s in va:
+            X_val.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip))
+            y_val.append(label)
+    return np.array(X_train, dtype=np.float32), np.array(y_train), np.array(X_val, dtype=np.float32), np.array(y_val)
+
+def build_vector_dataset_all(data_by_label, num_segments=40,
+                            peak_prom=0.15, thr=(0.2,0.4,0.6,0.8), peakcount_clip=10):
+    X, y = [], []
+    for label in sorted(data_by_label.keys()):
+        for s in data_by_label[label]:
+            X.append(encode_signal_to_vector(s, num_segments, peak_prom, thr, peakcount_clip))
+            y.append(label)
+    return np.array(X, dtype=np.float32), np.array(y)
+
+# =========================================================
+# ✅ Current Injection
+# =========================================================
+def repeat_current(x: torch.Tensor, T=50, noise_std=0.0):
+    cur = x.unsqueeze(0).repeat(T, 1, 1)
+    if noise_std > 0:
+        cur = cur + noise_std * torch.randn_like(cur)
+    return cur
+
+# =========================================================
+# ✅ ANN + SNN（LIF）分类器
+# =========================================================
+class ANNSNN(nn.Module):
+    def __init__(self, input_dim, hidden1=256, hidden2=128, num_classes=10,
+                 beta=0.9, threshold=1.0, dropout=0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden1)
+        self.ln1 = nn.LayerNorm(hidden1)
+        self.lif1 = snn.Leaky(beta=beta, threshold=threshold)
+        self.dp1 = nn.Dropout(dropout)
+
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.ln2 = nn.LayerNorm(hidden2)
+        self.lif2 = snn.Leaky(beta=beta, threshold=threshold)
+        self.dp2 = nn.Dropout(dropout)
+
+        self.fc3 = nn.Linear(hidden2, num_classes)
+        self.lif_out = snn.Leaky(beta=beta, threshold=threshold)
+
+    def forward(self, x_vec, T=50, noise_std=0.0):
+        cur_in = repeat_current(x_vec, T=T, noise_std=noise_std)
+
+        mem1 = self.lif1.init_leaky()
+        mem2 = self.lif2.init_leaky()
+        memo = self.lif_out.init_leaky()
+
+        mem_out_rec, spk_out_rec = [], []
+
+        for t in range(T):
+            x = cur_in[t]
+
+            cur1 = self.fc1(x)
+            cur1 = self.ln1(cur1)
+            cur1 = torch.relu(cur1)
+            spk1, mem1 = self.lif1(cur1, mem1)
+            spk1 = self.dp1(spk1)
+
+            cur2 = self.fc2(spk1)
+            cur2 = self.ln2(cur2)
+            cur2 = torch.relu(cur2)
+            spk2, mem2 = self.lif2(cur2, mem2)
+            spk2 = self.dp2(spk2)
+
+            cur3 = self.fc3(spk2)
+            spk3, memo = self.lif_out(cur3, memo)
+
+            mem_out_rec.append(memo)
+            spk_out_rec.append(spk3)
+
+        mem_out = torch.stack(mem_out_rec, dim=0)
+        spk_out = torch.stack(spk_out_rec, dim=0)
+        return mem_out, spk_out
+
+# =================== 训练（保持你原结构） ===================
+def train_on_clean_ann_snn(X_train, y_train, X_val, y_val,
+                           epochs=60, batch_size=64, lr=1e-3, weight_decay=2e-3,
+                           T=60, beta=0.9, threshold=0.9, dropout=0.2,
+                           noise_std=0.01, grad_clip=1.0):
+    pin = (device.type == "cuda")
+
+    train_ds = TensorDataset(torch.tensor(X_train), torch.tensor(y_train).long())
+    val_ds   = TensorDataset(torch.tensor(X_val),   torch.tensor(y_val).long())
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, pin_memory=pin)
+
+    net = ANNSNN(
+        input_dim=X_train.shape[1],
+        hidden1=256,
+        hidden2=128,
+        num_classes=10,
+        beta=beta,
+        threshold=threshold,
+        dropout=dropout
+    ).to(device)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_acc = -1.0
+    best_state = None
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        total_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=pin)
+            yb = yb.to(device, non_blocking=pin)
+
+            mem_out, _ = net(xb, T=T, noise_std=noise_std)
+            logits = mem_out.mean(dim=0)
+            loss = loss_fn(logits, yb)
+
+            opt.zero_grad()
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+            opt.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        net.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=pin)
+                yb = yb.to(device, non_blocking=pin)
+                mem_out, _ = net(xb, T=T, noise_std=0.0)
+                pred = mem_out.mean(dim=0).argmax(dim=1)
+                correct += (pred == yb).sum().item()
+                total += yb.size(0)
+
+        acc = correct / max(1, total)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+
+        cur_lr = scheduler.get_last_lr()[0]
+        avg_loss = total_loss / max(1, len(train_loader))
+        print(f"Epoch {ep:02d}: Loss={avg_loss:.4f}, ValAcc={acc:.4f}, Best={best_acc:.4f}, LR={cur_lr:.6f}")
+
+    if best_state is not None:
+        net.load_state_dict(best_state)
+
+    return net
+
+# =================== 推理（可投票） ===================
+def infer_with_vote(net, X, T=70, vote_k=5):
+    pin = (device.type == "cuda")
+    ds = TensorDataset(torch.tensor(X))
+    loader = DataLoader(ds, batch_size=128, shuffle=False, pin_memory=pin)
+
+    net.eval()
+    preds = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device, non_blocking=pin)
+
+            logits_sum = 0.0
+            for _ in range(max(1, vote_k)):
+                mem_out, _ = net(xb, T=T, noise_std=0.0)
+                logits_sum = logits_sum + mem_out.mean(dim=0)
+
+            pred = (logits_sum / max(1, vote_k)).argmax(dim=1).cpu().numpy()
+            preds.extend(pred.tolist())
+
+    return np.array(preds, dtype=int)
+
+# =================== 主流程 ===================
+if __name__ == "__main__":
+    clean_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/00-99clean"
+    noisy_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/00-99"
+
+    target_len = 1200
+    pad_mode = "edge"
+
+    num_segments = 35
+    peak_prom = 0.08
+    peakcount_clip = 6
+    thr = (0.45, 0.55, 0.7, 0.8)
+
+    lr = 1e-3
+    batch_size = 32
+    weight_decay = 1e-3
+
+    T = 70
+    beta = 0.9
+    threshold = 0.8
+    dropout = 0.2
+
+    noise_std = 0.01
+    grad_clip = 1.0
+    epochs = 30
+
+    vote_k_test = 5  # 你之前常用的投票次数
+
+    # ========== 读取（不计时） ==========
+    clean_by_label = load_dataset_from_root(clean_root, target_len=target_len, pad_mode=pad_mode, mode="clean")
+    noisy_by_label = load_dataset_from_root(noisy_root, target_len=target_len, pad_mode=pad_mode, mode="noisy")
+    clean_count = sum(len(v) for v in clean_by_label.values())
+    noisy_count = sum(len(v) for v in noisy_by_label.values())
+    print(f"[XLSX-clean] samples: {clean_count}")
+    print(f"[XLSX-noisy] samples: {noisy_count}")
+
+    # ========== 训练（你没要求计时，这里默认不计入对比） ==========
+    X_train, y_train, X_val, y_val = build_vector_dataset_train_val(
+        clean_by_label, train_ratio=0.9,
+        num_segments=num_segments, peak_prom=peak_prom, thr=thr, peakcount_clip=peakcount_clip
+    )
+    net = train_on_clean_ann_snn(
+        X_train, y_train, X_val, y_val,
+        epochs=epochs, batch_size=batch_size, lr=lr, weight_decay=weight_decay,
+        T=T, beta=beta, threshold=threshold, dropout=dropout,
+        noise_std=noise_std, grad_clip=grad_clip
+    )
+
+    # ========== TIME：XLSX noisy（Feature + Inference）==========
+    print("\n===== TIME: XLSX noisy (Feature + Inference) =====")
+    t0 = time.perf_counter()
+
+    # 特征（不含读取）
+    X_noisy, y_noisy = build_vector_dataset_all(
+        noisy_by_label,
+        num_segments=num_segments, peak_prom=peak_prom, thr=thr, peakcount_clip=peakcount_clip
+    )
+
+    # 推理（投票）
+    y_pred = infer_with_vote(net, X_noisy, T=T, vote_k=vote_k_test)
+
+    t1 = time.perf_counter()
+    acc = float((y_pred == y_noisy).mean())
+
+    print(f"[XLSX noisy (Feature+Infer)] Accuracy: {acc:.4f}")
+    print(f"[TIME] XLSX noisy (Feature+Infer): {t1 - t0:.4f} s")
