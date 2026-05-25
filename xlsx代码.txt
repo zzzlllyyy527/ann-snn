@@ -13,9 +13,9 @@ from collections import defaultdict
 import random
 
 from scipy.signal import find_peaks
-import snntorch as snn  # ✅ SNN
+import snntorch as snn  
 
-# =================== 固定随机种子 ===================
+
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
@@ -24,12 +24,12 @@ torch.manual_seed(seed)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device, "| torch:", torch.__version__, "| cuda:", torch.cuda.is_available())
 
-# =================== 从文件名解析标签 ===================
+
 def parse_label_from_filename(fname: str):
     m = re.match(r"^\s*(\d)", fname)
     return int(m.group(1)) if m else None
 
-# =================== 长度统一：边界值补齐（推荐） ===================
+
 def fix_length(signal, target_len=1200, pad_mode="edge"):
     signal = np.asarray(signal, dtype=float)
     n = len(signal)
@@ -50,7 +50,7 @@ def fix_length(signal, target_len=1200, pad_mode="edge"):
     else:
         return np.pad(signal, (left, right), mode="constant", constant_values=0.0)
 
-# =================== 归一化（用于原始波形） ===================
+
 def normalize_proportional(signal):
     signal = np.asarray(signal, dtype=float)
     min_val = np.min(signal)
@@ -59,7 +59,7 @@ def normalize_proportional(signal):
         return np.ones_like(signal) * 0.5
     return 0.01 + 0.99 * (signal - min_val) / (max_val - min_val)
 
-# =================== 读取 xlsx：自动跳过非数值 ===================
+
 def read_xlsx_signal(path, skiprows=0):
     df = pd.read_excel(path, header=None, skiprows=skiprows)
     s = df.iloc[:, 0]
@@ -72,7 +72,7 @@ def read_xlsx_signal_clean(path):
 def read_xlsx_signal_noisy(path):
     return read_xlsx_signal(path, skiprows=1)
 
-# =================== 数据集加载（不计时） ===================
+
 def load_dataset_from_root(root_dir, target_len=1200, pad_mode="edge", mode="clean"):
     data_by_label = defaultdict(list)
 
@@ -110,7 +110,7 @@ def load_dataset_from_root(root_dir, target_len=1200, pad_mode="edge", mode="cle
 
     return data_by_label
 
-# =================== 核心：不依赖时间的“计数编码” ===================
+
 def robust_norm_01(x, eps=1e-6, z_clip=10.0):
     x = np.asarray(x, dtype=float)
     med = np.median(x, axis=0)
@@ -185,18 +185,14 @@ def build_vector_dataset_all(data_by_label, num_segments=40,
             y.append(label)
     return np.array(X, dtype=np.float32), np.array(y)
 
-# =========================================================
-# ✅ Current Injection
-# =========================================================
+
 def repeat_current(x: torch.Tensor, T=50, noise_std=0.0):
     cur = x.unsqueeze(0).repeat(T, 1, 1)
     if noise_std > 0:
         cur = cur + noise_std * torch.randn_like(cur)
     return cur
 
-# =========================================================
-# ✅ ANN + SNN（LIF）分类器
-# =========================================================
+
 class ANNSNN(nn.Module):
     def __init__(self, input_dim, hidden1=256, hidden2=128, num_classes=10,
                  beta=0.9, threshold=1.0, dropout=0.2):
@@ -248,7 +244,7 @@ class ANNSNN(nn.Module):
         spk_out = torch.stack(spk_out_rec, dim=0)
         return mem_out, spk_out
 
-# =================== 训练（保持你原结构） ===================
+
 def train_on_clean_ann_snn(X_train, y_train, X_val, y_val,
                            epochs=60, batch_size=64, lr=1e-3, weight_decay=2e-3,
                            T=60, beta=0.9, threshold=0.9, dropout=0.2,
@@ -323,7 +319,7 @@ def train_on_clean_ann_snn(X_train, y_train, X_val, y_val,
 
     return net
 
-# =================== 推理（可投票） ===================
+
 def infer_with_vote(net, X, T=70, vote_k=5):
     pin = (device.type == "cuda")
     ds = TensorDataset(torch.tensor(X))
@@ -345,7 +341,7 @@ def infer_with_vote(net, X, T=70, vote_k=5):
 
     return np.array(preds, dtype=int)
 
-# =================== 主流程 ===================
+
 if __name__ == "__main__":
     clean_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/00-99clean"
     noisy_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/00-99"
@@ -371,9 +367,9 @@ if __name__ == "__main__":
     grad_clip = 1.0
     epochs = 30
 
-    vote_k_test = 5  # 你之前常用的投票次数
+    vote_k_test = 5  
 
-    # ========== 读取（不计时） ==========
+
     clean_by_label = load_dataset_from_root(clean_root, target_len=target_len, pad_mode=pad_mode, mode="clean")
     noisy_by_label = load_dataset_from_root(noisy_root, target_len=target_len, pad_mode=pad_mode, mode="noisy")
     clean_count = sum(len(v) for v in clean_by_label.values())
@@ -381,7 +377,7 @@ if __name__ == "__main__":
     print(f"[XLSX-clean] samples: {clean_count}")
     print(f"[XLSX-noisy] samples: {noisy_count}")
 
-    # ========== 训练（你没要求计时，这里默认不计入对比） ==========
+
     X_train, y_train, X_val, y_val = build_vector_dataset_train_val(
         clean_by_label, train_ratio=0.9,
         num_segments=num_segments, peak_prom=peak_prom, thr=thr, peakcount_clip=peakcount_clip
@@ -397,13 +393,13 @@ if __name__ == "__main__":
     print("\n===== TIME: XLSX noisy (Feature + Inference) =====")
     t0 = time.perf_counter()
 
-    # 特征（不含读取）
+
     X_noisy, y_noisy = build_vector_dataset_all(
         noisy_by_label,
         num_segments=num_segments, peak_prom=peak_prom, thr=thr, peakcount_clip=peakcount_clip
     )
 
-    # 推理（投票）
+   
     y_pred = infer_with_vote(net, X_noisy, T=T, vote_k=vote_k_test)
 
     t1 = time.perf_counter()
