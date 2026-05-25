@@ -16,7 +16,6 @@ from scipy.signal import find_peaks, resample, stft, istft
 from scipy.io import wavfile
 import snntorch as snn  # ✅ SNN
 
-# =================== 固定随机种子 ===================
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
@@ -25,13 +24,13 @@ torch.manual_seed(seed)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device, "| torch:", torch.__version__, "| cuda:", torch.cuda.is_available())
 
-# =================== 从文件名解析标签 ===================
+
 def parse_label_from_filename(fname: str):
     base = os.path.basename(fname)
     m = re.match(r"^\s*(\d)", base)
     return int(m.group(1)) if m else None
 
-# =================== WAV 读取与写回 ===================
+
 def read_wav_mono(path):
     sr, x = wavfile.read(path)
 
@@ -66,7 +65,7 @@ def normalize_proportional(signal):
         return np.ones_like(signal) * 0.5
     return 0.01 + 0.99 * (signal - min_val) / (max_val - min_val)
 
-# =================== 数据集加载（WAV，单层目录） ===================
+
 def load_wav_dataset_from_root(root_dir, mode="clean"):
     data_by_label = defaultdict(list)
 
@@ -83,15 +82,13 @@ def load_wav_dataset_from_root(root_dir, mode="clean"):
         if sig is None or len(sig) == 0:
             continue
 
-        # 归一化到 0.01~0.99（保持你原来逻辑）
+       
         sig = normalize_proportional(sig)
         data_by_label[int(label)].append(sig)
 
     return data_by_label
 
-# =========================================================
-# ✅ 谱减法（Spectral Subtraction）降噪
-# =========================================================
+
 def spectral_subtraction_denoise(
     x, sr,
     nperseg=512, noverlap=None,
@@ -100,9 +97,7 @@ def spectral_subtraction_denoise(
     beta=0.02,
     smooth_noise=0.0,
 ):
-    """
-    经典谱减：|S| = max(|Y| - alpha*|D|, beta*|Y|)
-    """
+   
     x = np.asarray(x, dtype=np.float32)
     if x.size < 8:
         return x
@@ -161,7 +156,7 @@ def spectral_subtraction_denoise(
 
 def denoise_wav_folder_spectral_subtraction(
     noisy_root, denoised_root,
-    overwrite=True,               # ✅ 默认：覆盖旧文件，保证调参有效
+    overwrite=True,               
     nperseg=512,
     noise_sec=0.2,
     alpha=1.0,
@@ -200,13 +195,13 @@ def denoise_wav_folder_spectral_subtraction(
     print(f"[SpectralSub] 完成：total={len(wavs)} processed={processed} skipped={skipped}")
     print("输出目录：", os.path.abspath(denoised_root))
 
-# =================== 核心：不依赖时间的“计数编码” ===================
+
 def robust_norm_01(x, eps=1e-6, z_clip=10.0):
     x = np.asarray(x, dtype=float)
     med = np.median(x, axis=0)
     mad = np.median(np.abs(x - med), axis=0) + eps
     z = (x - med) / mad
-    z = np.clip(z, -z_clip, z_clip)  # ✅ 防 overflow
+    z = np.clip(z, -z_clip, z_clip)  
     return 1.0 / (1.0 + np.exp(-z))
 
 def segment_stats_with_peakcount(signal, num_segments=40, peak_prom=0.15, min_len=64):
@@ -299,18 +294,14 @@ def build_vector_dataset_all(data_by_label, num_segments=40,
             y.append(label)
     return np.array(X, dtype=np.float32), np.array(y)
 
-# =========================================================
-# ✅ Current Injection
-# =========================================================
+
 def repeat_current(x: torch.Tensor, T=50, noise_std=0.0):
     cur = x.unsqueeze(0).repeat(T, 1, 1)
     if noise_std > 0:
         cur = cur + noise_std * torch.randn_like(cur)
     return cur
 
-# =========================================================
-# ✅ ANN + SNN（LIF）分类器
-# =========================================================
+
 class ANNSNN(nn.Module):
     def __init__(self, input_dim, hidden1=256, hidden2=128, num_classes=10,
                  beta=0.9, threshold=1.0, dropout=0.2):
@@ -361,7 +352,7 @@ class ANNSNN(nn.Module):
         spk_out = torch.stack(spk_out_rec, dim=0)
         return mem_out, spk_out
 
-# =================== 训练与评估 ===================
+
 def train_on_clean_ann_snn(X_train, y_train, X_val, y_val,
                            epochs=60, batch_size=64, lr=1e-3, weight_decay=2e-3,
                            T=70, beta=0.9, threshold=0.8, dropout=0.2,
@@ -509,33 +500,33 @@ def save_training_and_cm_to_xlsx(out_path, loss_list, acc_list, cm,
 
     print("已保存训练曲线与混淆矩阵到：", os.path.abspath(out_path))
 
-# =================== 主流程 ===================
+
 if __name__ == "__main__":
     clean_root = r"D:降噪声学传感器4.7/fsdd_jackson"
     noisy_root = r"D:降噪声学传感器4.7/fsdd_jackson_noisy1"
 
-    # ✅ 固定一个“新文件夹”存放降噪数据集（每次覆盖）
+    
     denoised_root = r"C:/Users/11033/Desktop/降噪声学传感器4.7/fsdd_jackson_noisy1_specsub_denoised"
 
-    # ✅ 编码参数（保持你原来的风格）
+  
     num_segments = 50
     peak_prom = 0.08
     peakcount_clip = 5
     thr = (0.45, 0.55, 0.7, 0.8)
     min_len = 64
 
-    # ✅ 训练超参
+    
     lr = 1e-3
     batch_size = 32
     weight_decay = 1e-3
 
-    # ✅ SNN 参数
+   
     T = 70
     beta = 0.9
     threshold = 0.8
     dropout = 0.2
 
-    # ✅ 稳定性增强
+   
     noise_std = 0.01
     grad_clip = 1.0
     epochs = 30
@@ -546,9 +537,9 @@ if __name__ == "__main__":
 
     out_xlsx = r"C:/Users/11033/Desktop/clean_metrics_and_cm_ANN_SNN_WAV_specsub.xlsx"
 
-    # ====== 谱减参数（不改你参数）======
+    
     do_denoise = True
-    overwrite_denoised = True   # ✅ 关键：每次都覆盖，保证调参有效
+    overwrite_denoised = True   
 
     noise_sec = 0.05
     alpha = 3
@@ -556,7 +547,7 @@ if __name__ == "__main__":
     nperseg = 512
     smooth_noise = 0.0
 
-    # 1) Clean 数据（训练/验证）
+   
     clean_by_label = load_wav_dataset_from_root(clean_root, mode="clean")
     clean_count = sum(len(v) for v in clean_by_label.values())
     print(f"[Clean-WAV] 加载样本数: {clean_count}")
@@ -572,7 +563,7 @@ if __name__ == "__main__":
     )
     print(f"[Clean-WAV] Train: {len(X_train)} | Val: {len(X_val)} | Input shape: {X_train.shape} (应为 {num_segments*4})")
 
-    # 2) 训练
+   
     net, loss_list, acc_list = train_on_clean_ann_snn(
         X_train, y_train, X_val, y_val,
         epochs=epochs,
@@ -590,7 +581,7 @@ if __name__ == "__main__":
     )
     plot_train_curves(loss_list, acc_list)
 
-    # 3) Clean Val 评估 + 保存
+  
     _, _, _, cm_clean = evaluate_on_dataset_ann_snn(
         net, X_val, y_val,
         title="Clean Val (ANN+SNN, WAV)",
@@ -600,7 +591,7 @@ if __name__ == "__main__":
     )
     save_training_and_cm_to_xlsx(out_xlsx, loss_list, acc_list, cm_clean)
 
-    # 4) Noisy Test（原始噪声数据集）——保留原逻辑
+   
     noisy_by_label = load_wav_dataset_from_root(noisy_root, mode="noisy")
     noisy_count = sum(len(v) for v in noisy_by_label.values())
     print(f"[Noisy-WAV] 加载样本数: {noisy_count}")
@@ -623,11 +614,11 @@ if __name__ == "__main__":
         vote_k=test_vote_k
     )
 
-    # 5) ✅ 计时：SpectralSub + Feature + Infer（并输出降噪后准确率）
+  
     if do_denoise:
         print("\n===== TIME: WAV (SpectralSub + Feature + Inference) =====")
 
-        # --- 5.1 计时谱减（生成降噪后的新数据集，覆盖写入） ---
+     
         t0 = time.perf_counter()
         denoise_wav_folder_spectral_subtraction(
             noisy_root=noisy_root,
@@ -642,13 +633,13 @@ if __name__ == "__main__":
         t1 = time.perf_counter()
         t_specsub = t1 - t0
 
-        # ✅ 快速检查：确认确实覆盖生效
+      
         test_fn = sorted([f for f in os.listdir(noisy_root) if f.lower().endswith(".wav")])[0]
         sr0, x0 = read_wav_mono(os.path.join(noisy_root, test_fn))
         sr1, x1 = read_wav_mono(os.path.join(denoised_root, test_fn))
         print(f"[Check] example file: {test_fn} | mean|diff|={float(np.mean(np.abs(x0 - x1))):.6f}")
 
-        # --- 5.2 计时特征（denoised_root -> X_den, y_den） ---
+       
         t2 = time.perf_counter()
         den_by_label = load_wav_dataset_from_root(denoised_root, mode="denoised")
         X_den, y_den = build_vector_dataset_all(
@@ -662,13 +653,11 @@ if __name__ == "__main__":
         t3 = time.perf_counter()
         t_feature = t3 - t2
 
-        # --- 5.3 计时推理（只对降噪后的 X_den 推理） ---
-        # 为了计时更准确：GPU 需要同步
+     
         if device.type == "cuda":
             torch.cuda.synchronize()
         t4 = time.perf_counter()
 
-        # 推理：复用你原来的 evaluate（它会打印 accuracy + confusion matrix）
         _, _, den_acc, _ = evaluate_on_dataset_ann_snn(
             net, X_den, y_den,
             title="Noisy Test (Spectral Subtraction, Overwrite) (ANN+SNN, WAV)",
